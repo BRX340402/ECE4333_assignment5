@@ -1,0 +1,97 @@
+#pragma once
+#include <Wire.h>
+#include <math.h>
+#include "MapConfig.h"
+// Z gyro + wheel-command model.
+// IMU: GY-521 (MPU6050) only, as in the kit list. type 1 = MPU6050 family at 0x68/0x69 (clones: any WHO_AM_I that answers),
+//   set to +/-500 dps (65.5 LSB/dps), 44 Hz low-pass, gyro Z at 0x47 (big endian)
+// ELEGOO V4 kit: GY-521 (MPU6050) on A4=SDA / A5=SCL, AD0 not connected -> 0x68 (WHO_AM_I 0x68 = 104).
+// If nothing answers at boot, the I2C bus is recovered (9 SCL pulses + STOP: an MPU6050
+// interrupted mid-read by a UNO reset can hold SDA low until power-off) and detection is
+// retried every 2 s while the car is parked.
+// Test10 run1 showed yaw = 0 for a whole run: never drive a mapping run without a gyro.
+struct PoseEstimate {
+ float lsbPerDps=65.5f;
+ float yawRate=0,yawDegrees=0,gyroSign=-1.0f; // yawDegrees: unwrapped, + = left turn (check with GS)
+ float x=0,y=0,heading=0,bias=0,dist=0;
+ bool biasReady=false,gyro=false;uint32_t last=0,lastDetect=0;
+ uint8_t imuType=0,imuAddr=0,whoMpu=0xFF; // diagnostics (IM in N221)
+ uint8_t readFails=0,busRecoveries=0;
+ // Zero button on the web page: non-blocking 1 s bias re-measurement, then heading/position zeroed.
+ bool calibrating=false,calDone=false;uint32_t calStart=0,calLast=0;long calSum=0;int calN=0;
+ void startRecal(uint32_t now){if(!biasReady){zero(now);calDone=true;return;}calibrating=true;calStart=calLast=now;calSum=0;calN=0;}
+ __attribute__((noinline)) void zero(uint32_t now){x=y=heading=yawDegrees=dist=0;last=now;}
+ static float wrap(float a){while(a>PI)a-=2*PI;while(a< -PI)a+=2*PI;return a;}
+ static bool writeReg(uint8_t addr,uint8_t reg,uint8_t v){Wire.beginTransmission(addr);Wire.write(reg);Wire.write(v);return Wire.endTransmission()==0;}
+ static bool readReg(uint8_t addr,uint8_t reg,uint8_t *buf,uint8_t n){
+  Wire.beginTransmission(addr);Wire.write(reg);if(Wire.endTransmission(false))return false;
+  if(Wire.requestFrom(addr,n)!=n)return false;for(uint8_t i=0;i<n;i++)buf[i]=Wire.read();return true;
+ }
+ bool raw(int16_t &v){
+  uint8_t b[2];
+  if(imuType==1){if(!readReg(imuAddr,0x47,b,2))return false;v=(int16_t)((b[0]<<8)|b[1]);return true;}
+  return false;
+ }
+ void busRecover(){
+  Wire.end(); // Test14b: SCL clock-out recovery removed to save flash; power-cycle if the gyro stays missing
+  Wire.begin();
+ #if defined(WIRE_HAS_TIMEOUT)
+  Wire.setWireTimeout(3000,true);
+ #endif
+  busRecoveries++;
+ }
+ bool detect(){
+  imuType=0;uint8_t w;
+  for(uint8_t a=0x68;a<=0x69;a++){
+   if(readReg(a,0x75,&w,1)){whoMpu=w;
+    if(writeReg(a,0x6B,0)&&writeReg(a,0x1A,3)&&writeReg(a,0x1B,0x08)){imuType=1;imuAddr=a;lsbPerDps=65.5f;delay(50);return true;}
+   }
+  }
+  return false;
+ }
+ // Blocking ~0.8 s: call only while the car is still.
+ bool calibrate(){
+  long sum=0;int16_t v;int ok=0;
+  for(int i=0;i<200;i++){if(raw(v)){sum+=v;ok++;}delay(4);}
+  biasReady=ok>=150;if(biasReady)bias=sum/(float)ok;
+  gyro=biasReady;readFails=0;return biasReady;
+ }
+ void begin(){
+  Wire.begin();
+ #if defined(WIRE_HAS_TIMEOUT)
+  Wire.setWireTimeout(3000,true);
+ #endif
+  delay(100);                                   // IMU power-up time
+  if(!detect()){busRecover();if(detect())calibrate();}else calibrate();
+  last=lastDetect=millis();
+ }
+ // parked: motors off for a while -> retry detection, slowly track gyro bias drift
+ void step(int left,int right,uint32_t now,bool parked){
+  if(!gyro&&biasReady&&parked)biasReady=false;   // reads keep failing while parked: start over
+  if(!biasReady&&parked&&uint32_t(now-lastDetect)>=2000){lastDetect=now;busRecover();if(detect())calibrate();last=millis();return;}
+  if(calibrating){
+   int16_t v;if(uint32_t(now-calLast)>=5){calLast=now;if(raw(v)){calSum+=v;calN++;}}
+   yawRate=0;
+   if(uint32_t(now-calStart)>=1000){if(calN>=50)bias=calSum/(float)calN;zero(now);calibrating=false;calDone=true;}
+   return;
+  }
+  float dt=uint32_t(now-last)*0.001f;if(dt<0.01f)return;last=now;
+  if(dt>0.25f)return; // skip an abnormal stall instead of integrating a huge step
+  float vl=left*LEFT_CM_S_PER_PWM,vr=right*RIGHT_CM_S_PER_PWM,v=(vl+vr)*0.5f;
+  float wk=(vr-vl)/TRACK_WIDTH_CM,w=wk;int16_t gz;
+  if(biasReady&&raw(gz)){
+   gyro=true;readFails=0;
+   if(parked&&fabs(gz-bias)<2*lsbPerDps)bias+=0.002f*(gz-bias);
+   float rate=gyroSign*(gz-bias)/lsbPerDps;yawRate=rate;
+   yawDegrees+=rate*dt; // still integrates while parked so a hand rotation can verify the sign
+   w=rate*PI/180.0f;
+  }else{
+   yawRate=0;
+   if(biasReady&&++readFails>=20){gyro=false;} // ~0.2 s of failed reads: report it
+   if(gyro)w=0; // single missed read: keep heading, do not switch to the wheel model
+  }
+  dist+=v*dt;
+  // Test15: the wheel-only (predicted) pose is computed by the web page from the logged PWM (same model), to save UNO flash
+  x+=v*cos(heading+w*dt/2)*dt;y+=v*sin(heading+w*dt/2)*dt;heading=wrap(heading+w*dt);
+ }
+};
