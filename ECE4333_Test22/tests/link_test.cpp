@@ -77,7 +77,10 @@ int main(){
 
  Serial.out.clear();send(followStart(188,62,15,10));
  CHECK(mode==7&&follow.stopW==188&&replied("\"N\":211,\"OK\":1"),"target following start (mode 7, stop width 188 = 75 px)");
+ CHECK(follow.state==TargetFollow::LOOK&&panNow==0,"target following starts with the camera search (car still, camera straight ahead)");
+ run(400);   // camera settled straight ahead
  send("{\"N\":215,\"S\":1,\"V\":1,\"T\":1,\"X\":500,\"W\":120,\"A\":40}");run(700);
+ CHECK(panNow==0&&OCR1B==(uint16_t)(1088+90L*3712/180),"camera servo pulse = straight ahead (1472 us)");
  CHECK(follow.state==TargetFollow::TRACK,"colour frame N215 drives the follower (TRACK)");
  send("{\"N\":100}");
  CHECK(mode==0,"STOP CAR ends target following");

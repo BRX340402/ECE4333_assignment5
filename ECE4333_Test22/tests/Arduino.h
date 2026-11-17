@@ -15,6 +15,14 @@
 #define A3 17
 #define PI 3.14159265358979323846
 #define constrain(x,a,b) ((x)<(a)?(a):((x)>(b)?(b):(x)))
+// Timer1 registers (camera pan servo, PanServo.h)
+#define _BV(b) (1u<<(b))
+#define COM1B1 5
+#define WGM11 1
+#define WGM12 3
+#define WGM13 4
+#define CS11 1
+static uint8_t TCCR1A,TCCR1B;static uint16_t ICR1,OCR1B;
 extern uint32_t fakeNow;
 extern int fakeRange,fakeFloor[3],fakePins[32];
 inline uint32_t millis(){return fakeNow;}

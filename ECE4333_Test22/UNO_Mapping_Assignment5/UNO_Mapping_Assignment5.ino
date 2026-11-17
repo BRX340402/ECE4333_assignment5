@@ -14,6 +14,7 @@
 #include "LinkTx.h"
 #include "TargetFollow.h"
 #include "Overtake.h"
+#include "PanServo.h"
 
 PoseEstimate pose;LineFollower follower;RaceRules traffic;TargetFollow follow;Overtake ovt;
 // mode: 0 standby, 6 figure-8 line following, 7 cone / target following
@@ -40,7 +41,7 @@ bool hyst(bool was,int v){
  int t=blackHigh+(was?LINE_HYST:-LINE_HYST);return v<=t;                              // black = low readings
 }
 int8_t gyroSignLearned=0;uint8_t gyroSignFlips=0; // auto-corrected gyro direction (kept until power-off)
-int usRange(){return rangeCm;} // ultrasonic distance straight ahead (-1 = no echo)
+int usRange(){return panAhead()?rangeCm:-1;} // ultrasonic distance straight ahead (-1 = no echo, or the camera / sensor is turned)
 
 // battery LED state
 uint8_t battV10=0;uint32_t ledAt=0;
@@ -59,7 +60,7 @@ uint8_t motionBlockReason(int l,int r){
  if(!pose.gyro)return 10;
  if(pose.calibrating)return 2;
  if(mode==6){if(traffic.stopped())return 5;if(follower.state==LineFollower::FAIL)return 3;return 9;}
- if(mode==7){if(follow.state==TargetFollow::ARRIVED)return 7;if(follow.state==TargetFollow::HOLD)return follow.sweptDeg>=FOLLOW_SWEEP_MAX_DEG?8:6;}
+ if(mode==7){if(follow.state==TargetFollow::ARRIVED)return 7;if(follow.state==TargetFollow::LOOK)return 11;if(follow.state==TargetFollow::HOLD)return follow.sweptDeg>=FOLLOW_SWEEP_MAX_DEG?8:6;}
  return 9;
 }
 void standby(){follower.stop();follow.stop();traffic.reset();ovt.reset();mode=0;motorOutput(0,0);}
@@ -101,7 +102,7 @@ void command(char *text){
  if(n==220){if(mode==7)follow.next(pose.yawDegrees,millis());return;} // next cone of the sequence: look around for it now
  if(n==215){ // colour target frame: S seq, V valid, T seen, X centre x and W width (per mille of the image), A frame age ms
   static const char K215[] PROGMEM="S\0V\0T\0X\0W\0A";
-  if(mode==7&&doc[K215].isUInt16()){long a[6];for(uint8_t i=0;i<6;i++)a[i]=doc[K215+2*i];follow.measure((uint16_t)a[0],a[1]==1,a[2]==1,(int)a[3],(int)a[4],(int)a[5]);}
+  if(mode==7&&doc[K215].isUInt16()){long a[6];for(uint8_t i=0;i<6;i++)a[i]=doc[K215+2*i];follow.measure((uint16_t)a[0],a[1]==1,a[2]==1,(int)a[3],(int)a[4],(int)a[5],millis());}
   return;
  }
  if(n==218)return; // track localizer (removed in Test22)
@@ -181,7 +182,7 @@ void sensors(){
 char tx[340];uint16_t txPos=0,txLen=0; // longest message (N221 with every field at its widest, 330 bytes) is checked by tests/link_test.cpp; the ESP32 accepts 352
 uint8_t trafficState(){
  // TS shown by the web page: 0 OFF, 2 TRACK, 3 STOP sign ahead (slow), 4 STOP hold, 7 CROSS, 8 FAULT, 9-12 target following
- if(mode==7)return 8+follow.state; // 9 TRACK, 10 ARRIVED, 11 target lost (stopped), 12 searching
+ if(mode==7)return 8+follow.state; // 9 TRACK, 10 ARRIVED, 11 target lost (stopped), 12 car turning to search, 13 camera search
  if(mode!=6)return 0;
  if(traffic.st!=RaceRules::GO&&traffic.st!=RaceRules::DONE)return traffic.ts();
  switch(follower.state){case LineFollower::CROSS:return 7;case LineFollower::FAIL:return 8;default:return 2;}
@@ -239,6 +240,7 @@ void pumpTx(){int a=Serial.availableForWrite();while(txPos<txLen&&a-->0)Serial.w
 void setup(){
  Serial.begin(LINK_BAUD);
  ledBegin();
+ panBegin();   // camera straight ahead
  pinMode(MOTOR_STBY,OUTPUT);pinMode(MOTOR_LEFT_PWM,OUTPUT);pinMode(MOTOR_RIGHT_PWM,OUTPUT);
  pinMode(MOTOR_LEFT_DIR,OUTPUT);pinMode(MOTOR_RIGHT_DIR,OUTPUT);motorOutput(0,0);
  pinMode(US_TRIG_PIN,OUTPUT);pinMode(US_ECHO_PIN,INPUT);
@@ -288,6 +290,7 @@ void loop(){
  else if(mode==7){
   follow.step(pose.yawDegrees,pose.yawRate,now,usRange(),left,right);
  }
+ panSet(mode==7?follow.pan:0);   // camera search turns the servo; otherwise straight ahead
  blockReason=motionBlockReason(left,right);motorOutput(left,right);
  if(pose.calDone){pose.calDone=false;zeroRevision++;}
  uint32_t period=mode?SAMPLE_MS:IDLE_SAMPLE_MS;

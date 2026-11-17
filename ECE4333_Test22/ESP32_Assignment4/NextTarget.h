@@ -1,14 +1,13 @@
 #pragma once
 #include <atomic>
 #include "RedDetector.h"
-// After a target is reached, a region of its colour may be the next target only after that colour has left the image once
-// (the car turned away from the reached target), and only if it is small (far: under half the stop width) and does not touch
-// the image side (a target sliding out of view looks narrow). Another colour may be chosen at once.
-std::atomic<int> reachedColour{-1};std::atomic<bool> reachedGone{false};std::atomic<int> followStopPm{188};
-static bool nextTargetOk(const RedRegion &g,bool seen,int c){
- if(c!=reachedColour.load())return true;
- if(!seen){reachedGone=true;return false;}
- bool edge=g.x<=2||g.x+g.w>=g.imageW-2;
- if(reachedGone.load()&&g.imageW>0&&!edge&&(long)g.w*2000/g.imageW<followStopPm.load()){reachedColour=-1;return true;}
- return false;
+// Target following, Auto colour (Test22). Colours: 0 green, 1 red, 2 blue.
+// The first target is the first colour seen (the largest region if several colours are seen at once). Every next target
+// may be any colour EXCEPT the colour just reached (only that one colour is excluded, nothing accumulates): red -> green or
+// blue -> ... so the target just reached is never chosen again at once, and courses such as r-g-r-g work.
+std::atomic<int> lastReached{-1};   // colour of the target reached last, -1 = none yet
+static int chooseColour(const bool seen[3],const int px[3],int last){
+ int best=-1,bp=0;
+ for(int c=0;c<3;c++)if(c!=last&&seen[c]&&px[c]>bp){best=c;bp=px[c];}
+ return best;
 }

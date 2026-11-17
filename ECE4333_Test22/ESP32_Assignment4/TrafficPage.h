@@ -93,11 +93,11 @@ summary{cursor:pointer;font-weight:600}a{color:#8cd7ff}.tablewrap{overflow:auto}
 <p id="ovtNow" class="hint">Car is using: —</p>
 </section>
 <section data-profile="mapping" hidden><h2>Target following</h2>
-<p class="hint">The targets are not fixed. The car follows the first red, green or blue target the camera sees (the largest if there are several), slows down and stops in front of it, then turns to look for the next target of any colour (the target it has just reached is skipped until it is far away). It keeps going until the number of targets below is reached, nothing is found after a full look-around, or STOP CAR. It uses the colour detection of the Camera tab.</p>
+<p class="hint">The targets are not fixed. Auto: the car follows the first red, green or blue target the camera sees (the largest if there are several), slows down and stops in front of it, then turns to look for the next target, which may be any colour <b>except the colour it has just reached</b> (e.g. after red: green or blue; after green: red or blue). To find a target the car first stands still and turns the camera: straight ahead, then 20°, 40° and 60° to each side, so targets in front are found first; only if the camera finds nothing does the car turn slowly on the spot (up to about one turn). It keeps going until the number of targets below is reached, nothing is found, or STOP CAR. A single colour (Red / Green / Blue only) = drive to one target of that colour and stop. It uses the colour detection of the Camera tab.</p>
 <div class="stats"><div><span class="num" id="fwSeen">—</span><small>Target seen</small></div><div><span class="num" id="fwW">—</span><small>Target width</small></div><div><span class="num" id="fwSt" style="font-size:18px">—</span><small>State</small></div></div>
 <div class="actions"><button class="primary big" id="followNow" onclick="startFollow()">Start target following</button></div>
-<label>Target colour  <select id="FC"><option value="a">Auto (any colour, first one seen)</option><option value="g">Green only</option><option value="r">Red only</option><option value="b">Blue only</option></select></label>
-<label>Targets to reach  (0 = keep going until STOP CAR, 0-9) <input id="FN" type="number" min="0" max="9" value="0"></label>
+<label>Target colour  <select id="FC"><option value="a">Auto (first colour seen, then a different colour each time)</option><option value="g">Green only (one target)</option><option value="r">Red only (one target)</option><option value="b">Blue only (one target)</option></select></label>
+<label>Targets to reach in Auto  (0 = keep going until STOP CAR, 0-9) <input id="FN" type="number" min="0" max="9" value="0"></label>
 <label>Stop when the target is this wide  (pixels of the analysis image) <input id="FW" type="number" min="5" max="1600" value="75"></label>
 <details><summary>Advanced tuning</summary>
 <label>Camera horizontal field of view  (°, 20-140) <input id="FF" type="number" min="20" max="140" value="62"> <input id="FM" type="checkbox">image mirrored </label>
@@ -215,7 +215,7 @@ summary{cursor:pointer;font-weight:600}a{color:#8cd7ff}.tablewrap{overflow:auto}
 </div>
 </main>
 <script>
-const $=id=>document.getElementById(id),names=['OFF ','—','TRACK ','STOP AHEAD: SLOW ','STOP: AI CHECK ·','RESERVED ','STOP: HOLD / SCAN ·','CROSSING ','FAULT ','FOLLOW: TRACKING ','FOLLOW: ARRIVED ','FOLLOW: NO TARGET, STOPPED ·','FOLLOW: SEARCHING '];
+const $=id=>document.getElementById(id),names=['OFF ','—','TRACK ','STOP AHEAD: SLOW ','STOP: AI CHECK ·','RESERVED ','STOP: HOLD / SCAN ·','CROSSING ','FAULT ','FOLLOW: TRACKING ','FOLLOW: ARRIVED ','FOLLOW: NO TARGET, STOPPED ·','FOLLOW: TURNING THE CAR TO SEARCH ','FOLLOW: CAMERA SEARCH '];
 const keys=['SC','BL','BH','RA','SA','CT','GS','CS','DS','RP','RPS','RPL','WST','SDC','CWS','CDC'],TABS=['drive','map','camera','setup'];let driving=false,latest=null,scannedToken=null,sampleResolution=null,currentTab='drive',previewTimer=null,previewBusy=false,previewPaused=false,previewURL=null,previewStamp='',previewLastShown=0,cameraBusy=false,starting=false;
 let floorSamples={},floorSampling=false;
 async function sampleFloor(kind){
@@ -272,7 +272,7 @@ function resetSample(){scannedToken=null;sampleResolution=null;}
 function showObjects(objects){for(const k of ['red','green','blue','stop']){const v=objects[k]||{};$(k+'Seen').textContent=!v.valid?'—':v.seen?'Yes':'No';$(k+'Pixels').textContent=v.valid&&v.seen?v.pixels:'—';$(k+'Width').textContent=v.valid&&v.seen&&v.width>0?v.width:'—';$(k+'Distance').textContent=v.valid&&v.seen&&v.distance_cm>=0?v.distance_cm:'—';}}
 const faultReasons={10:'The gyro turned the wrong way during a pivot — set Gyro Z sign GS (Settings) and check by hand',15:'Line not found after a stop',11:'Line not found after the full search (too fast / tape too narrow / lifted?)',14:'Object too close for the line search'};
 function faultMessage(u){const code=Number(u.FC);return code>0?`FAULT ${code} — ${faultReasons[code]||'Unknown fault'}. Press STOP CAR, fix the cause, place the car on the line, then Start.`:'FAULT — press STOP CAR before restarting.';}
-const pauseNames={0:'motor command active',1:'standby',2:'gyro calibration',3:'line-following fault',4:'object too close',5:'STOP sign hold',6:'target not acquired / lost',7:'target reached',8:'target search limit reached',9:'controller currently commands zero',10:'gyro feedback unavailable'};
+const pauseNames={0:'motor command active',1:'standby',2:'gyro calibration',3:'line-following fault',4:'object too close',5:'STOP sign hold',6:'target not acquired / lost',7:'target reached',8:'target search limit reached',9:'controller currently commands zero',10:'gyro feedback unavailable',11:'looking for a target with the camera (car still)'};
 function motionDiagnostic(u,stale){
  if(stale)return 'UNO telemetry stale: motor state is unknown.';
  if(u.UV!==51)return 'Firmware mismatch: upload BOTH Test22 ESP32 and UV=51 UNO.';
@@ -948,7 +948,8 @@ function followLive(d){
  const t=(d.objects||{})[k]||{},u=d.uno||{},pm=t.valid&&t.seen&&t.image_w>0?Math.round(1000*t.width/t.image_w):null;
  $('fwSeen').textContent=!k?(f.color==='a'?'auto: none yet':'—'):k+': '+(!t.valid?'not sampled':t.seen?'Yes':'No');
  $('fwW').textContent=pm===null?'—':t.width+' px / '+pm+' per mille (image '+t.image_w+' px)';
- $('fwSt').textContent=d.age_ms<1500&&u.M===7?(names[u.TS]||'—')+' | reached '+(f.reached||0)+(f.targets?' / '+f.targets:''):'—';
+ const lastK={r:'red',g:'green',b:'blue'}[f.last];
+ $('fwSt').textContent=d.age_ms<1500&&u.M===7?(names[u.TS]||'—')+' | reached '+(f.reached||0)+(f.targets?' / '+f.targets:'')+(lastK&&f.color==='a'?' | next: not '+lastK:''):'—';
 }
 
 let savedTab='drive';try{savedTab=localStorage.getItem('ece4333-test21-tab')||'drive';}catch(e){}

@@ -16,9 +16,15 @@
 //  INNER LOOP (every loop pass, >100 Hz): HeadingPD on the gyro-fused heading
 //    (err = setYaw - yaw, rate = gyro rate) -> wheel differential u; left = v-u, right = v+u.
 //
+// SEARCH (Test22): to find a target the car first stands still and turns the CAMERA (pan servo, LOOK): straight ahead,
+//  then 20, 40, 60 deg to each side (the side the last target was on first), so targets in front are found first. Only a
+//  frame captured after the servo has settled counts; its bearing is pan angle + image bearing. Found: the servo returns
+//  to straight ahead and the car turns to that heading (TRACK). Nothing found: the servo returns and the CAR turns slowly
+//  (SWEEP, FOLLOW_SWEEP_DPS) up to FOLLOW_SWEEP_MAX_DEG; then it stops (search limit).
+//
 // Pure logic (no Arduino calls) so tests/follow_test.cpp can simulate it on a PC.
 struct TargetFollow{
- enum State:uint8_t{IDLE=0,TRACK=1,ARRIVED=2,HOLD=3,SWEEP=4};
+ enum State:uint8_t{IDLE=0,TRACK=1,ARRIVED=2,HOLD=3,SWEEP=4,LOOK=5};
  // parameters (set by the sketch from the web page)
  int stopW=FOLLOW_STOP_W_PM,fov=FOLLOW_FOV_DEG,speed=60; // fov < 0 = camera image mirrored
  HeadingPD pd;
@@ -29,24 +35,35 @@ struct TargetFollow{
  // latest camera frame (consumed by the outer loop)
  bool pending=false,pendSeen=false;int pendX=500,pendW=0;float pendYaw=0;uint16_t seq=0;bool seqSeen=false;
  int8_t side=1;float sweptDeg=0;uint32_t lastMs=0;
+ // camera pan (LOOK): pan = wanted camera angle (deg, + = left of the car axis), set by this struct, driven by the sketch
+ int8_t pan=0,pendPan=0;uint8_t lookIdx=0;bool looked=false;uint32_t panAt=0,pendAt=0;
+ void setPan(int8_t a,uint32_t now){if(a!=pan){pan=a;panAt=now;}}
+ // look position i: 0 = straight, then +-STEP, +-2 STEP ... (the side of the last target first)
+ int8_t lookAngle(uint8_t i)const{if(!i)return 0;int a=((i+1)/2)*FOLLOW_PAN_STEP_DEG;return (int8_t)((i&1)?side*a:-side*a);}
+ static const uint8_t LOOK_POSITIONS=1+2*(FOLLOW_PAN_MAX_DEG/FOLLOW_PAN_STEP_DEG);
+ void look(uint32_t now){state=LOOK;lookIdx=0;looked=false;setPan(0,now);panAt=now;}
  // yaw history (0.1 deg, every 50 ms) to look up the heading at the moment a frame was captured
  int16_t hist[8];uint8_t hp=0;uint32_t histAt=0;
 
  void start(float yaw,uint32_t now){
-  state=HOLD;setYaw=yaw;err10=bear10=0;widthPm=0;outerAt=seenAt=lostAt=lastMs=histAt=now; // stand still until the target is seen
+  setYaw=yaw;err10=bear10=0;widthPm=0;outerAt=seenAt=lostAt=lastMs=histAt=now;
   pending=pendSeen=false;seqSeen=false;side=1;sweptDeg=0;ignoreUntil=0;usStop=false;usArm=true;
+  look(now);seenAt=now-FOLLOW_LOST_HOLD_MS-1;   // stand still and look with the camera until the target is seen
   for(uint8_t i=0;i<8;i++)hist[i]=(int16_t)(yaw*10);hp=0;
  }
- void stop(){state=IDLE;}
+ void stop(){state=IDLE;pan=0;}
  static float norm180(float a){a=fmodf(a+180.0f,360.0f);if(a<0)a+=360.0f;return a-180.0f;}
  void remember(float yaw,uint32_t now){
   if(uint32_t(now-histAt)<50)return;
   histAt=now;float v=yaw*10;hist[hp++&7]=(int16_t)(v>32000?32000:(v<-32000?-32000:v));
  }
  // N215 from the ESP32. ageMs = how old the frame was when it was sent.
- void measure(uint16_t s,bool valid,bool seen,int x,int w,int ageMs){
+ void measure(uint16_t s,bool valid,bool seen,int x,int w,int ageMs,uint32_t now){
   if(seqSeen&&s==seq)return;seq=s;seqSeen=true;
   if(!valid||ageMs<0||ageMs>1200)return;
+  uint32_t at=now-(uint32_t)ageMs;
+  if(int32_t(at-(panAt+FOLLOW_PAN_SETTLE_MS))<0)return; // captured while the camera was still turning
+  pendAt=at;pendPan=pan;
   int idx=(ageMs+25)/50;if(idx<0)idx=0;if(idx>7)idx=7;
   pendYaw=hist[(hp-1-idx)&7]*0.1f;
   pendSeen=seen;pendX=x;pendW=w;pending=true;
@@ -55,7 +72,7 @@ struct TargetFollow{
  // Test18: next cone of the sequence (ESP32 N220): forget the old target and search right away, starting to the
  // side the last target was on; frames of the old colour that are still in flight are ignored for 400 ms.
  uint32_t ignoreUntil=0;bool usStop=false,usArm=true; // usArm: the ultrasonic saw open space since the last cone
- void next(float yaw,uint32_t now){if(state==IDLE)return;state=SWEEP;setYaw=yaw;sweptDeg=0;pending=false;usStop=false;usArm=false;seenAt=now-FOLLOW_LOST_HOLD_MS-1;ignoreUntil=now+400;widthPm=0;}
+ void next(float yaw,uint32_t now){if(state==IDLE)return;look(now);setYaw=yaw;sweptDeg=0;pending=false;usStop=false;usArm=false;seenAt=now-FOLLOW_LOST_HOLD_MS-1;ignoreUntil=now+400;widthPm=0;}
  void step(float yaw,float rate,uint32_t now,int range,int &left,int &right){
   left=right=0;
   if(state==IDLE||state==ARRIVED){lastMs=now;return;} // arrival is latched until next() / start()
@@ -63,13 +80,15 @@ struct TargetFollow{
   remember(yaw,now);
   // ---- outer loop ----
   if(pending&&int32_t(now-ignoreUntil)<0)pending=false;
-  if(uint32_t(now-outerAt)>=FOLLOW_OUTER_MS&&pending){
-   outerAt=now;pending=false;
+  if(pending&&int32_t(pendAt-(panAt+FOLLOW_PAN_SETTLE_MS))<0)pending=false; // the camera moved after this frame
+  if(pending&&(state!=TRACK||uint32_t(now-outerAt)>=FOLLOW_OUTER_MS)){ // searching: use every frame at once
+   outerAt=now;pending=false;if(state==LOOK)looked=true;
    if(pendSeen){
-    float b=(0.5f-pendX*0.001f)*fov;       // deg, + = left (camera not mirrored)
+    float b=(0.5f-pendX*0.001f)*fov+pendPan; // deg, + = left of the car (camera not mirrored); + pan angle
     setYaw=pendYaw+b;bear10=(int16_t)(b*10);widthPm=pendW;
     side=b>=0?1:-1;seenAt=now;sweptDeg=0;
-    if(state==HOLD||state==SWEEP)state=TRACK;
+    if(state==HOLD||state==SWEEP||state==LOOK)state=TRACK;
+    setPan(0,now);                           // camera back to straight ahead; the car turns to the target
    }
   }
   uint32_t lost=uint32_t(now-seenAt);
@@ -87,8 +106,15 @@ struct TargetFollow{
     if(widthPm>=FOLLOW_NEAR_PM)state=ARRIVED;
     else{state=HOLD;lostAt=now;}
    }
-  }else if(state==HOLD&&lost>FOLLOW_SWEEP_AFTER_MS&&sweptDeg<FOLLOW_SWEEP_MAX_DEG)state=SWEEP;
-  if(state==SWEEP){ // look for the target: the set point slides towards the side it was last seen on
+  }else if(state==HOLD&&lost>FOLLOW_SWEEP_AFTER_MS&&sweptDeg<FOLLOW_SWEEP_MAX_DEG)look(now);
+  if(state==LOOK){ // camera search: next position after a settled frame was checked there (or the camera is slow)
+   uint32_t here=now-panAt;
+   if((looked&&here>=FOLLOW_PAN_DWELL_MS)||here>=3*FOLLOW_PAN_DWELL_MS){
+    if(++lookIdx<LOOK_POSITIONS){looked=false;setPan(lookAngle(lookIdx),now);}
+    else{setPan(0,now);state=SWEEP;setYaw=yaw;sweptDeg=0;} // nothing in view: turn the car slowly
+   }
+  }
+  if(state==SWEEP&&int32_t(now-(panAt+FOLLOW_PAN_SETTLE_MS))>=0){ // turn the car: the set point slides towards the side it was last seen on
    float d=FOLLOW_SWEEP_DPS*dt*0.001f;setYaw+=side*d;sweptDeg+=d;
    if(sweptDeg>=FOLLOW_SWEEP_MAX_DEG)state=HOLD;
   }
@@ -104,6 +130,6 @@ struct TargetFollow{
    else v*=1.0f-0.5f*ae/20;                 // slow down while the heading error is large
    if(v<lo)v=lo;                            // below this the motors stall
   }
-  if(state==HOLD||state==ARRIVED)left=right=0;else pd.steer(err,rate,v,FOLLOW_PIVOT_MIN_PWM,left,right);
+  if(state==HOLD||state==ARRIVED||state==LOOK)left=right=0;else pd.steer(err,rate,v,FOLLOW_PIVOT_MIN_PWM,left,right);
  }
 };

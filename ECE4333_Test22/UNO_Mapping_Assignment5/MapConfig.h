@@ -64,6 +64,14 @@ static const uint16_t FOLLOW_LOST_HOLD_MS = 1500;  // target not seen this long:
 static const uint16_t FOLLOW_SWEEP_AFTER_MS = 3000;// ... and after this long start looking around
 static const int FOLLOW_MIN_PWM = 40;      // lowest forward PWM that still moves the car
 static const int FOLLOW_PIVOT_MIN_PWM = 50;// lowest in-place turn PWM that still turns the car
-static const int FOLLOW_SWEEP_DPS = 45;    // search sweep speed
+static const int FOLLOW_SWEEP_DPS = 30;    // search: slow car turn after the camera search found nothing
+// Camera pan servo (camera + ultrasonic on one bracket, D10). Servo 90 = straight ahead; PAN_DIR +1: a LARGER servo angle
+// looks LEFT (checked on this car in Assignment 4, run 13). If the car turns AWAY from a target found with the camera turned,
+// set PAN_DIR = -1.
+static const int8_t PAN_DIR = 1;
+static const int FOLLOW_PAN_STEP_DEG = 20;   // camera search: look straight, then 20, 40, 60 deg to each side
+static const int FOLLOW_PAN_MAX_DEG = 60;
+static const uint16_t FOLLOW_PAN_SETTLE_MS = 350; // frames / ultrasonic readings taken while the servo turns are ignored
+static const uint16_t FOLLOW_PAN_DWELL_MS = 800;  // time at each camera position (needs at least one settled frame)
 static const int FOLLOW_STOP_CM = 15;      // Test18: ultrasonic distance at which the car stops in front of a cone
 static const int FOLLOW_SWEEP_MAX_DEG = 400;

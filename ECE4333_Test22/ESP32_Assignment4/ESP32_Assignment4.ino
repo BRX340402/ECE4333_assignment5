@@ -78,11 +78,14 @@ bool zoneAllowsColour(){return trafficMode.load()!=6||(raceZone.load()==1||raceZ
 std::atomic<uint32_t> targetSelectedAt{0};
 std::atomic<int> followColor{0}; // target following: 0 = green, 1 = red, 2 = blue, 3 = auto (set by /follow-start)
 std::atomic<int> autoLock{-1};   // auto: the colour being followed (0 green, 1 red, 2 blue), -1 none
+std::atomic<int> lastLocked{-1}; // auto: the colour locked most recently (kept when the lock times out)
+std::atomic<int> followStopPm{188}; // target following: stop width, per mille of the image width (set by /follow-start)
 uint32_t autoSeenAt=0;
 #define AUTO_HOLD_MS 1500           // auto: a locked colour that is briefly lost is kept this long before re-choosing
 void setFollowColor(char c){followColor=c=='r'?1:(c=='b'?2:(c=='a'?3:0));autoLock=-1;targetSelectedAt=millis();} // colour selection never changes the detector
-// Auto target (Test22): the first colour seen in the image is followed (largest if several at once) and stays locked.
-#include "NextTarget.h"   // which region may be the next target after one is reached (tests/next_target_test.cpp)
+// Auto target (Test22): the first colour seen is followed (largest if several at once) and stays locked; after a target is
+// reached the next one is any colour except the one just reached (NextTarget.h, tests/next_target_test.cpp).
+#include "NextTarget.h"
 template<typename R> int pickAutoColour(const R &s){
  auto see=[&](int c){return c==1?s.seen:(c==0?s.greenSeen:s.blueSeen);};
  auto reg=[&](int c)->const RedRegion&{return c==1?s.region:(c==0?s.green:s.blueRegion);};
@@ -90,9 +93,9 @@ template<typename R> int pickAutoColour(const R &s){
  int cur=autoLock.load();
  if(cur>=0&&see(cur)){autoSeenAt=millis();return cur;}
  if(cur>=0&&uint32_t(millis()-autoSeenAt)<AUTO_HOLD_MS)return cur;
- int best=-1,bp=0;
- for(int c=0;c<3;c++)if(nextTargetOk(reg(c),see(c),c)&&see(c)&&size(c)>bp){best=c;bp=size(c);}
- if(best>=0){autoLock=best;autoSeenAt=millis();reachedColour=-1;return best;}
+ bool sn[3];int px[3];for(int c=0;c<3;c++){sn[c]=see(c);px[c]=size(c);}
+ int best=chooseColour(sn,px,lastReached.load());
+ if(best>=0){autoLock=best;lastLocked=best;autoSeenAt=millis();return best;}
  autoLock=-1;return -1;
 }
 std::atomic<uint32_t> trafficReceived{0},verifySince{0};
@@ -114,12 +117,12 @@ bool camSize(int id,int &w,int &h);   // Test18: frame size from the camera driv
 TrackEKF loc;bool locPending=false;
 // Test16 EKF-SLAM (Slam.h) + cone sequence
 SlamEKF slam;bool slamOn=false;int slamMode=0;float slamRaw=0,slamYaw=0;uint16_t slamQ=0,slamN=0;int camFov=62; // deg, negative = image mirrored
-// Target following (Test22): the targets are not fixed. followTargets = targets to reach (0 = keep going until STOP CAR or
-// nothing is found after a full look-around), followReached = reached so far.
+// Target following (Test22): the targets are not fixed. followTargets = targets to reach in Auto (0 = keep going until
+// STOP CAR or nothing is found after a full look-around), followReached = reached so far. A fixed colour = one target.
 int followTargets=0,followReached=0;ConeProgress coneProgress;
 static const float ROBOT_CAM_CM=8,ROBOT_US_CM=10;  // camera / ultrasonic ahead of the robot centre (the SLAM pose point)
 void onUnoMode(int was,int now){
- if(was==7&&now!=7){coneProgress.reset();reachedColour=-1;}
+ if(was==7&&now!=7){coneProgress.reset();lastReached=-1;}
  if(now==6&&was!=6)setFollowColor('g'); // figure 8: green first (the A5 build then alternates green / blue)
 }
 struct DriveSettings {int sc=25,bl=600,bh=1023,ra=180,sa=360,ct=1500,gs=0,cs=60,rs=0,ds=40,rpx=100,rps=0,rpl=0,wst=0,sdc=20,cws=0,cdc=30;}; // Test16: cws = cone width (per mille of the image) at cdc cm, for SLAM range (0 = cones not used) // Test15: wst = STOP-sign width (per mille of the image) at the stop distance sdc cm (0 = use RP pixels) // Test14: rps = STOP slow-down pixels (0 = RP/3), rpl = red-light pixels (0 = any red region)
@@ -857,7 +860,7 @@ void setup(){
   driveSettings=next;settingsID=settingsID%30000+1;settingsApplied=false;sendDriveSettings();web.send(200,"text/plain","Saved. Waiting for UNO acknowledgement; check Applied status.");
  });
  web.on("/traffic",HTTP_GET,sendHomePage);
- web.on("/traffic-status",HTTP_GET,[]{web.sendHeader("Cache-Control","no-store");web.send(200,"application/json",String("{\"esp_ms\":")+String(millis())+",\"firmware\":\"Test22\",\"follow\":{\"color\":\""+String(followColor==1?"r":(followColor==2?"b":(followColor==3?"a":"g")))+"\",\"locked\":\""+String(autoLock.load()==1?"r":(autoLock.load()==2?"b":(autoLock.load()==0?"g":"")))+"\",\"reached\":"+String(followReached)+",\"targets\":"+String(followTargets)+",\"waiting_departure\":"+String(coneProgress.awaitDeparture)+"},\"red_wpm\":"+String(lastRedWn.load())+",\"loc\":{\"P\":"+String(loc.P,1)+",\"K\":"+String(loc.k,3)+",\"S\":"+String(sqrtf(loc.p00),1)+",\"E\":"+String(loc.events)+",\"H\":"+String(loc.hOff,1)+"}"+",\"sensors\":"+unoStatus+",\"sensors_age_ms\":"+String(millis()-lastUno)+",\"vision_health\":"+redResults()+",\"uno\":"+trafficTelemetry+",\"age_ms\":"+String(millis()-trafficReceived.load())+",\"calibration\":"+calibrationJSON()+",\"settings\":"+driveSettingsJSON()+",\"framesize\":"+String(esp_camera_sensor_get()->status.framesize)+",\"objects\":"+liveObjectsJSON()+",\"detect_enabled\":"+String((bool)detectEnabled)+",\"color_enabled\":"+String((bool)colorEnabled)+"}");});
+ web.on("/traffic-status",HTTP_GET,[]{web.sendHeader("Cache-Control","no-store");web.send(200,"application/json",String("{\"esp_ms\":")+String(millis())+",\"firmware\":\"Test22\",\"follow\":{\"color\":\""+String(followColor==1?"r":(followColor==2?"b":(followColor==3?"a":"g")))+"\",\"locked\":\""+String(autoLock.load()==1?"r":(autoLock.load()==2?"b":(autoLock.load()==0?"g":"")))+"\",\"last\":\""+String(lastReached.load()==1?"r":(lastReached.load()==2?"b":(lastReached.load()==0?"g":"")))+"\",\"reached\":"+String(followReached)+",\"targets\":"+String(followTargets)+",\"waiting_departure\":"+String(coneProgress.awaitDeparture)+"},\"red_wpm\":"+String(lastRedWn.load())+",\"loc\":{\"P\":"+String(loc.P,1)+",\"K\":"+String(loc.k,3)+",\"S\":"+String(sqrtf(loc.p00),1)+",\"E\":"+String(loc.events)+",\"H\":"+String(loc.hOff,1)+"}"+",\"sensors\":"+unoStatus+",\"sensors_age_ms\":"+String(millis()-lastUno)+",\"vision_health\":"+redResults()+",\"uno\":"+trafficTelemetry+",\"age_ms\":"+String(millis()-trafficReceived.load())+",\"calibration\":"+calibrationJSON()+",\"settings\":"+driveSettingsJSON()+",\"framesize\":"+String(esp_camera_sensor_get()->status.framesize)+",\"objects\":"+liveObjectsJSON()+",\"detect_enabled\":"+String((bool)detectEnabled)+",\"color_enabled\":"+String((bool)colorEnabled)+"}");});
  web.on("/traffic-start",HTTP_POST,[]{
   if(esp_camera_sensor_get()->status.colorbar){web.send(409,"text/plain","Turn off sensor test colour bars before driving");return;}
   if(trafficMode!=0){web.send(409,"text/plain","Already active. Use STOP CAR before starting a new run.");return;}
@@ -894,7 +897,7 @@ void setup(){
   if(trafficMode!=0){web.send(409,"text/plain","Already active. Use STOP CAR first.");return;}
   if(!settingsApplied||millis()-trafficReceived.load()>1500){web.send(409,"text/plain","Wait for fresh UNO telemetry and settings acknowledgement");return;}
   if(trafficTelemetry.indexOf("\"GY\":0")>=0){web.send(409,"text/plain","Gyro not working: target following needs the gyro. Power-cycle with the car still.");return;}
-  setFollowColor(col[0]);camFov=fov;followStopPm=w;followTargets=n;followReached=0;reachedColour=-1;coneProgress.reset();
+  setFollowColor(col[0]);camFov=fov;followStopPm=w;followTargets=n;followReached=0;lastReached=-1;lastLocked=-1;coneProgress.reset();
   sendJSON(String("{\"N\":101,\"D1\":7,\"D2\":")+String(w)+",\"D3\":"+String(fov)+",\"D4\":"+String(kp)+",\"D5\":"+String(kd)+"}");owner=1;
   web.send(200,"text/plain","Follow requested; check UNO state acknowledgement");
  });
@@ -940,16 +943,17 @@ void slamObserve(const RedRegion &t,uint8_t cls){
 }
 // ---- Target following, targets not fixed (driven by the UNO's 10 Hz samples): ARRIVED (follow state 2, stopped by the
 // ultrasonic or the stop width) for 0.6 s = this target is done: the ultrasonic range is a precise SLAM measurement of it
-// (bearing 0). Its colour is then skipped while it is still large in the image, and the UNO is told to look around for the
-// next target of any colour (N220). With a target count set, the car stops after that many targets.
+// (bearing 0). Auto: the next target is any colour except this one, and the UNO is told to look around for it (N220); with
+// a target count set the car stops after that many targets. A fixed colour (Red / Green / Blue only) = one target, then stop.
 void coneStep(int mode,int fs,int u,uint32_t sampleTime){
  if(mode!=7){coneProgress.reset();return;}
  if(!coneProgress.update(fs,sampleTime))return;
- int c=followColor.load();if(c==3)c=autoLock.load();   // colour of the target just reached (0 green, 1 red, 2 blue)
+ int c=followColor.load();if(c==3){c=autoLock.load();if(c<0)c=lastLocked.load();} // colour of the target just reached (0 green, 1 red, 2 blue)
  if(u>3&&u<80&&slamOn&&c>=0)slamObsRB(u+ROBOT_US_CM,0,c==1?1:(c==2?3:2));
  followReached++;char m[80];snprintf(m,sizeof(m),"{\"N\":253,\"q\":%u,\"i\":%d,\"n\":%d}",slamQ,followReached,followTargets);mapLogPush(String(m));
- if(followTargets>0&&followReached>=followTargets){sendJSON("{\"N\":100}");return;}
- reachedGone=false;reachedColour=c;autoLock=-1;targetSelectedAt=millis();sendJSON("{\"N\":220}");
+ lastReached=c;
+ if(followColor.load()!=3||(followTargets>0&&followReached>=followTargets)){sendJSON("{\"N\":100}");return;}
+ autoLock=-1;targetSelectedAt=millis();sendJSON("{\"N\":220}");
 }
 void locSample(const char *line){
  unsigned q,st,kk,sm;unsigned long t;int l,c,r,pl,pr,g10,x,y,u,kh,kx,ky;long yaw10,dmm;
@@ -1036,11 +1040,10 @@ void loop(){
    float beta=(A3_FX_NORMALIZED>0&&r.region.imageW)?atan((0.5f-(r.region.x+r.region.w*0.5f)/r.region.imageW)/A3_FX_NORMALIZED):0;
    if(trafficMode==7&&r.region.imageW>0){ // target following: the chosen colour's largest region, same detector and camera settings as Stop on red
     int selected=followColor.load();if(selected==3)selected=pickAutoColour(r);bool colourChosen=selected>=0;if(selected<0)selected=0; /* three independent colour regions */ bool green=selected!=1; const RedRegion &t=selected==2?r.blueRegion:(green?r.green:r.region);bool targetFresh=int32_t(r.captured-targetSelectedAt.load())>=0;bool seen=ok&&colourChosen&&targetFresh&&(selected==2?r.blueSeen:(green?r.greenSeen:r.seen))&&t.w>0;
-    if(selected==reachedColour.load()&&!nextTargetOk(t,seen,selected))seen=false; // the target just reached is not the next one
     int cx=seen?(int)((long)(t.x+t.w/2)*1000/t.imageW):500,wp=seen?(int)((long)t.w*1000/t.imageW):0;
     char f[100];snprintf(f,sizeof(f),"{\"N\":215,\"S\":%u,\"V\":%u,\"T\":%u,\"X\":%d,\"W\":%d,\"A\":%d}",r.seq,(unsigned)(ok&&targetFresh),(unsigned)seen,cx,wp,(int)(millis()-r.captured));sendJSON(f);
    }
-   if(ok&&trafficState!=5&&(trafficMode==6||trafficMode==7)){if(r.seen)slamObserve(r.region,1);if(r.greenSeen)slamObserve(r.green,2);if(r.blueSeen)slamObserve(r.blueRegion,3);} // Test16 SLAM: red = class 1, green = class 2
+   if(ok&&trafficState!=5&&trafficState!=13&&(trafficMode==6||trafficMode==7)){ /* 13: UNO camera search, the camera is turned: no map bearing */ if(r.seen)slamObserve(r.region,1);if(r.greenSeen)slamObserve(r.green,2);if(r.blueSeen)slamObserve(r.blueRegion,3);} // Test16 SLAM: red = class 1, green = class 2
    (void)redAction;char c[160];snprintf(c,sizeof(c),"{\"N\":204,\"S\":%u,\"V\":%u,\"R\":%u,\"G\":%u,\"Z\":%d,\"D\":%d,\"SD\":%d,\"B\":%d,\"LC\":%u}",r.seq,(unsigned)ok,(unsigned)(ok?level:0),(unsigned)(ok&&g&&zone==1),zone,d,sd,(int)(beta*1000),(unsigned)lightCalibrated);sendJSON(c);
   }
  }
